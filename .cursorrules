@@ -1,0 +1,360 @@
+# Generative Recommenders - Cursor AI Rules
+
+## 项目概述
+
+这是 Meta 开源的 **Generative Recommenders** 项目，实现了 ICML'24 论文《Actions Speak Louder than Words: Trillion-Parameter Sequential Transducers for Generative Recommendations》中的算法。
+
+### 核心特点
+- 将传统深度学习推荐系统（DLRMs）重新表述为生成建模问题
+- 实现了 HSTU（Hierarchical Sequential Transducer Unit）和 M-FALCON 等高效算法
+- 通过自定义 CUDA/Triton 内核实现 10x-1000x 的训练和推理加速
+- 支持十亿级用户规模的推荐系统，首次展示了推荐系统的 scaling law
+
+### 技术栈
+- **语言**: Python 3.10+
+- **深度学习框架**: PyTorch 2.6.0+, TorchRec 1.1.0+
+- **加速库**: FBGEMM GPU 1.1.0+, Triton (自定义内核)
+- **配置管理**: Gin-config
+- **数据处理**: Pandas
+- **实验追踪**: TensorBoard
+- **CUDA**: 12.4+ (Ubuntu 22.04 测试通过)
+
+## 项目结构
+
+```
+generative_recommenders/
+├── common.py                    # 核心抽象类和工具函数
+├── modules/                     # 核心模型模块
+│   ├── hstu_transducer.py      # HSTU Transducer 主模块
+│   ├── stu.py                  # STU (Sequential Transducer Unit) 基础层
+│   ├── dynamic_stu.py          # 动态 STU 实现
+│   ├── dlrm_hstu.py           # DLRM-v3 HSTU 模型
+│   ├── action_encoder.py       # 动作编码器
+│   ├── content_encoder.py      # 内容编码器
+│   ├── positional_encoder.py   # 位置编码器
+│   ├── preprocessors.py        # 输入预处理器
+│   ├── postprocessors.py       # 输出后处理器
+│   └── multitask_module.py     # 多任务学习模块
+├── ops/                        # 自定义算子和内核
+│   ├── cpp/                    # C++/CUDA 实现
+│   │   ├── hstu_attention/     # HSTU 注意力机制 (基于 FlashAttention V3)
+│   │   ├── cuda_hstu_attention.py
+│   │   └── [jagged tensor ops] # Jagged tensor 操作
+│   ├── triton/                 # Triton 内核实现
+│   │   ├── triton_jagged.py    # Jagged tensor Triton 内核
+│   │   ├── triton_hstu_linear.py
+│   │   ├── triton_addmm.py
+│   │   └── triton_attention_utils.py
+│   ├── pytorch/                # PyTorch 参考实现
+│   ├── hstu_attention.py       # 注意力机制接口
+│   ├── hstu_compute.py         # HSTU 计算核心
+│   ├── jagged_tensors.py       # Jagged tensor 工具
+│   └── benchmarks/             # 性能基准测试
+├── dlrm_v3/                    # DLRM-v3 实现
+│   ├── train/                  # 训练脚本
+│   │   └── train_ranker.py     # 主训练入口
+│   ├── inference/              # 推理基准
+│   │   └── main.py             # 推理入口
+│   └── datasets/               # 数据集加载器
+│       ├── movie_lens.py
+│       ├── kuairand.py
+│       └── synthetic_*.py
+└── research/                   # 研究代码
+    ├── modeling/               # 模型实现 (SASRec, HSTU 等)
+    ├── data/                   # 数据加载和预处理
+    ├── indexing/               # 候选索引
+    └── trainer/                # 训练循环
+        └── train.py            # 主训练函数
+
+configs/                        # Gin 配置文件
+├── ml-1m/                      # MovieLens-1M 配置
+├── ml-20m/                     # MovieLens-20M 配置
+├── ml-3b/                      # MovieLens-3B (合成数据) 配置
+└── amzn-books/                 # Amazon Books 配置
+
+main.py                         # 主入口点
+preprocess_public_data.py       # 数据预处理脚本
+run_fractal_expansion.py        # 分形扩展生成合成数据
+```
+
+## 核心概念
+
+### 1. HSTU (Hierarchical Sequential Transducer Unit)
+- **STU Layer** (`stu.py`): 基础的序列转换单元，包含自注意力机制和前馈网络
+- **STU Stack**: 多层 STU 堆叠
+- **HSTU Transducer** (`hstu_transducer.py`): 完整的 HSTU 模型，包含预处理、STU 计算和后处理
+
+### 2. Jagged Tensors
+- 用于高效处理变长序列的数据结构
+- 避免填充（padding）带来的计算浪费
+- 自定义 CUDA/Triton 内核优化操作：
+  - `concat_2D_jagged`: 连接 jagged tensors
+  - `split_2D_jagged`: 分割 jagged tensors
+  - `jagged_dense_bmm`: Jagged-dense 批量矩阵乘法
+  - `expand_1d_jagged_to_dense`: 扩展为 dense tensor
+
+### 3. HammerModule
+- 所有模型的基类 (`common.py`)
+- 支持多种内核后端：TRITON, TLX, PYTORCH, CUDA, TRITON_CC
+- 统一的训练/推理模式管理
+- 自动 dtype 转换和内核选择
+
+### 4. 多任务学习
+- 支持因果（causal）和非因果（non-causal）任务
+- 任务类型：点击、观看时长、评分等
+- 通过 `multitask_module.py` 实现多任务预测头
+
+### 5. 损失函数
+- **SampledSoftmaxLoss**: 采样 softmax 损失（推荐用于大规模）
+- **BCELoss**: 二元交叉熵损失
+- 支持温度缩放（temperature scaling）
+
+### 6. 负样本采样
+- **In-batch sampling**: 批内负样本采样
+- **Local sampling**: 从整个 item 集合采样
+- 支持 L2 归一化和去重
+
+## 编码规范
+
+### 1. 类型注解
+- 所有函数必须有完整的类型注解
+- 使用 `# pyre-strict` 或 `# pyre-unsafe` 标记
+- 遵循 PEP 484 类型提示规范
+
+```python
+def forward(
+    self,
+    x: torch.Tensor,
+    x_lengths: torch.Tensor,
+    x_offsets: torch.Tensor,
+    max_seq_len: int,
+) -> torch.Tensor:
+    pass
+```
+
+### 2. 模块继承
+- 模型模块继承 `HammerModule`
+- 实现 `__init__` 时调用 `super().__init__(is_inference=is_inference)`
+- 使用 `self.hammer_kernel()` 选择内核实现
+
+### 3. Torch.fx 兼容性
+- 使用 `@torch.fx.wrap` 装饰需要特殊处理的函数
+- 避免在模型中使用 Python 控制流（if/for），改用 `torch.where` 等
+
+```python
+@torch.fx.wrap
+def fx_unwrap_optional_tensor(optional: Optional[torch.Tensor]) -> torch.Tensor:
+    assert optional is not None
+    return optional
+```
+
+### 4. 性能优化
+- 使用 `torch.profiler.record_function` 标记关键代码段
+- 重计算（recomputation）策略减少显存占用
+- 激活检查点（activation checkpointing）用于大模型训练
+
+```python
+with record_function("hstu_attention"):
+    output = self._stu_module(...)
+```
+
+### 5. Gin 配置
+- 使用 `@gin.configurable` 装饰可配置函数
+- 配置文件使用 `.gin` 格式
+- 参数命名：`module_name.parameter_name = value`
+
+```python
+@gin.configurable
+def train_fn(
+    rank: int,
+    world_size: int,
+    dataset_name: str = "ml-20m",
+    learning_rate: float = 1e-3,
+) -> None:
+    pass
+```
+
+### 6. 分布式训练
+- 使用 `torch.multiprocessing` 进行多 GPU 训练
+- 通过 `rank` 和 `world_size` 管理进程
+- 使用 `torch.distributed` 进行通信
+
+### 7. 自定义算子
+- CUDA 算子注册：`TORCH_LIBRARY_FRAGMENT(hstu, m)`
+- 支持 CPU/CUDA/Meta 后端
+- Triton 内核使用 `@triton.jit` 和自动调优
+
+```python
+TORCH_LIBRARY_FRAGMENT(hstu, m) {
+  m.def("expand_1d_jagged_to_dense(...) -> Tensor");
+}
+
+TORCH_LIBRARY_IMPL(hstu, CUDA, m) {
+  m.impl("expand_1d_jagged_to_dense", hstu::expand_1d_jagged_to_dense_cuda);
+}
+```
+
+### 8. 错误处理
+- 使用 `assert` 进行前置条件检查
+- 使用 `raise ValueError` 报告配置错误
+- 使用 `logging` 记录重要信息
+
+```python
+assert self._is_inference == self._input_preprocessor._is_inference, \
+    f"Mode mismatch: {self._is_inference} vs {self._input_preprocessor._is_inference}"
+```
+
+## 开发工作流
+
+### 1. 数据准备
+```bash
+mkdir -p tmp/
+python3 preprocess_public_data.py  # 下载并预处理公开数据集
+```
+
+### 2. 训练模型
+```bash
+# 单 GPU 训练
+CUDA_VISIBLE_DEVICES=0 python3 main.py \
+  --gin_config_file=configs/ml-1m/hstu-sampled-softmax-n128-final.gin \
+  --master_port=12345
+
+# 多 GPU 训练 (DLRM-v3)
+LOCAL_WORLD_SIZE=4 WORLD_SIZE=4 \
+  python3 generative_recommenders/dlrm_v3/train/train_ranker.py \
+  --dataset movielens-1m --mode train
+```
+
+### 3. 推理评估
+```bash
+LOCAL_WORLD_SIZE=4 WORLD_SIZE=4 \
+  python3 generative_recommenders/dlrm_v3/inference/main.py \
+  --dataset movielens-1m
+```
+
+### 4. 监控训练
+```bash
+tensorboard --logdir exps/ml-1m-l200/ --port 24001 --bind_all
+```
+
+### 5. 运行测试
+```bash
+# 单元测试
+pytest generative_recommenders/modules/tests/
+pytest generative_recommenders/ops/tests/
+
+# 基准测试
+python3 generative_recommenders/ops/benchmarks/hstu_attention_bench.py
+```
+
+## 常见任务
+
+### 添加新模型
+1. 在 `generative_recommenders/modules/` 创建新模块
+2. 继承 `HammerModule` 或相关基类
+3. 实现 `forward` 方法
+4. 在 `research/modeling/sequential/encoder_utils.py` 注册
+5. 创建对应的 `.gin` 配置文件
+
+### 添加新算子
+1. 在 `ops/triton/` 实现 Triton 内核（快速原型）
+2. 在 `ops/cpp/` 实现 CUDA 内核（生产优化）
+3. 在 `ops/pytorch/` 实现 PyTorch 参考（验证正确性）
+4. 在对应的高层接口文件添加内核选择逻辑
+5. 在 `ops/tests/` 添加单元测试
+6. 在 `ops/benchmarks/` 添加性能测试
+
+### 添加新数据集
+1. 在 `dlrm_v3/datasets/` 创建数据集类
+2. 继承 `torch.utils.data.Dataset`
+3. 实现 `__getitem__` 和 `__len__`
+4. 在 `train_ranker.py` 的 `SUPPORTED_CONFIGS` 注册
+5. 创建对应的 `.gin` 配置文件
+
+### 调试技巧
+1. 设置环境变量 `CUDA_LAUNCH_BLOCKING=1` 获取准确的错误栈
+2. 使用 `torch.autograd.set_detect_anomaly(True)` 检测梯度异常
+3. 使用 `torch.profiler` 分析性能瓶颈
+4. 检查 `exps/` 目录下的 TensorBoard 日志
+
+## 性能优化建议
+
+### 1. 内核选择
+- **训练**: 使用 `HammerKernel.TRITON` (灵活性好)
+- **推理**: 使用 `HammerKernel.TRITON_CC` 或 `HammerKernel.CUDA` (性能最优)
+- **调试**: 使用 `HammerKernel.PYTORCH` (易于理解)
+
+### 2. 数据类型
+- 训练：BF16 (更好的数值稳定性)
+- 推理：FP16 或 INT8 (更快)
+- 使用 `enable_tf32=True` 加速 Ampere+ GPU
+
+### 3. 序列长度
+- 使用 `set_static_max_seq_lens()` 设置静态长度以优化内核编译
+- 使用 `autotune_max_seq_len()` 自动选择最优长度
+- 考虑使用位置采样（positional sampling）减少长序列开销
+
+### 4. 批大小
+- 根据 GPU 显存调整 `local_batch_size`
+- 使用梯度累积模拟更大批量
+- 推理时使用更大的 `eval_batch_size`
+
+### 5. 显存优化
+- 启用重计算：`recompute_normed_x=True`, `recompute_uvqk=True`
+- 使用激活检查点：`activation_checkpoint=True`
+- 减少 `max_sequence_length` 或使用采样
+
+## 重要注意事项
+
+1. **版权和许可**: 所有文件必须包含 Apache 2.0 许可证头
+2. **依赖管理**: 优先使用 `requirements.txt` 而非手动安装
+3. **GPU 要求**: 大多数实验需要 24GB+ HBM 的 GPU
+4. **CUDA 版本**: 推荐 CUDA 12.4+，某些内核需要 SM90+ (H100)
+5. **数据路径**: 默认使用 `tmp/` 存储数据，`exps/` 存储实验结果
+6. **随机种子**: 使用 `random_seed` 参数确保可重复性
+7. **分布式**: 使用 `forkserver` 启动方法避免 CUDA 初始化问题
+8. **FlashAttention**: HSTU 注意力基于 FlashAttention V3，针对 H100 优化
+
+## 相关资源
+
+- **论文**: [ICML'24 Paper](https://proceedings.mlr.press/v235/zhai24a.html)
+- **GitHub**: https://github.com/meta-recsys/generative-recommenders
+- **数据集**: MovieLens (1M/20M/3B), Amazon Reviews (Books), KuaiRand
+- **参考实现**: SASRec, BERT4Rec, GRU4Rec
+
+## AI 辅助开发指南
+
+当协助开发此项目时：
+
+1. **理解上下文**: 优先查看相关的 `.gin` 配置文件了解模型配置
+2. **遵循模式**: 参考现有模块的实现模式（如 `stu.py`, `hstu_transducer.py`）
+3. **性能优先**: 考虑使用 Triton/CUDA 内核而非纯 PyTorch 实现
+4. **类型安全**: 始终添加完整的类型注解
+5. **测试覆盖**: 为新功能添加单元测试和基准测试
+6. **文档完善**: 添加清晰的 docstring 和注释
+7. **向后兼容**: 保持与现有 API 的兼容性
+8. **分布式友好**: 考虑多 GPU 和多节点场景
+
+## 常见问题
+
+### Q: 如何切换不同的模型架构？
+A: 修改 `.gin` 配置文件中的 `train_fn.main_module`，可选 "HSTU" 或 "SASRec"。
+
+### Q: 如何调整模型大小？
+A: 修改 `hstu_encoder.num_blocks`, `num_heads`, `dqk`, `dv` 等参数。
+
+### Q: 如何使用自定义数据集？
+A: 参考 `dlrm_v3/datasets/movie_lens.py` 实现数据加载器，并创建相应的 `.gin` 配置。
+
+### Q: 训练速度慢怎么办？
+A: 检查是否启用了 TF32 (`enable_tf32=True`)，考虑使用更高效的内核（TRITON_CC/CUDA），减少序列长度或增加批大小。
+
+### Q: 显存不足怎么办？
+A: 启用重计算和激活检查点，减小批大小或模型大小，使用梯度累积。
+
+---
+
+**最后更新**: 2026-01-12
+**项目版本**: 0.1.0
+**维护者**: Meta RecSys Team
+
